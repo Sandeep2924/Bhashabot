@@ -1,6 +1,8 @@
 import os
 import uuid
 import traceback
+import platform
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -25,9 +27,10 @@ from groq import Groq
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="BhashaBot API", version="1.0.0")
 
+# Updated CORS to allow all origins temporarily to prevent frontend blocking on Render
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,17 +49,26 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"detail": f"{type(exc).__name__}: {str(exc)}"}
     )
 
-# ── Tesseract: auto-detect on Windows ────────────────────────────────────────
-_TESSERACT_CANDIDATES = [
-    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    rf"C:\Users\{os.getenv('USERNAME','')}\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
-]
-for _p in _TESSERACT_CANDIDATES:
-    if Path(_p).exists():
-        pytesseract.pytesseract.tesseract_cmd = _p
-        print(f"Tesseract found: {_p}")
-        break
+# ── Tesseract: Cross-Platform Support (Windows + Render/Linux) ───────────────
+if platform.system() == "Windows":
+    _TESSERACT_CANDIDATES = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        rf"C:\Users\{os.getenv('USERNAME','')}\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
+    ]
+    for _p in _TESSERACT_CANDIDATES:
+        if Path(_p).exists():
+            pytesseract.pytesseract.tesseract_cmd = _p
+            print(f"Windows Tesseract found: {_p}")
+            break
+else:
+    # Linux (Render) configuration
+    tess_path = shutil.which("tesseract")
+    if tess_path:
+        pytesseract.pytesseract.tesseract_cmd = tess_path
+        print(f"Linux Tesseract found: {tess_path}")
+    else:
+        print("WARNING: Tesseract not found. Make sure to install it via build.sh on Render.")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
@@ -86,17 +98,18 @@ collection = chroma_client.get_or_create_collection(
 print(f"ChromaDB ready. Existing chunks: {collection.count()}\n")
 
 # ── Groq client ───────────────────────────────────────────────────────────────
-groq_client = Groq(api_key=GROQ_API_KEY)
+if GROQ_API_KEY:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+else:
+    print("WARNING: Groq Client not initialized due to missing API Key.")
 
 
 # ── Text helpers ──────────────────────────────────────────────────────────────
-
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     pages = [page.get_text() for page in doc]
     doc.close()
     return "\n".join(pages).strip()
-
 
 def extract_text_from_image(file_bytes: bytes) -> str:
     image = Image.open(io.BytesIO(file_bytes))
@@ -105,7 +118,6 @@ def extract_text_from_image(file_bytes: bytes) -> str:
     except pytesseract.TesseractError:
         print("Hindi OCR pack missing, falling back to English only.")
         return pytesseract.image_to_string(image, lang="eng").strip()
-
 
 def chunk_text(text: str, chunk_size: int = 400, overlap: int = 80) -> list[str]:
     words = text.split()
@@ -118,19 +130,16 @@ def chunk_text(text: str, chunk_size: int = 400, overlap: int = 80) -> list[str]
         start += chunk_size - overlap
     return chunks
 
-
 def embed_and_store(chunks: list[str], doc_id: str, filename: str):
     embeddings = embedder.encode(chunks).tolist()
     ids = [f"{doc_id}_{i}" for i in range(len(chunks))]
     metas = [{"filename": filename, "doc_id": doc_id, "chunk_index": i} for i in range(len(chunks))]
     collection.add(documents=chunks, embeddings=embeddings, ids=ids, metadatas=metas)
 
-
 def retrieve_chunks(question: str, top_k: int = 4) -> list[str]:
     q_emb = embedder.encode([question]).tolist()
     results = collection.query(query_embeddings=q_emb, n_results=top_k)
     return results["documents"][0] if results and results["documents"] else []
-
 
 def build_prompt(question: str, chunks: list[str]) -> str:
     context = "\n\n---\n\n".join(chunks)
@@ -149,26 +158,20 @@ RULES:
 Question: {question}
 Answer:"""
 
-
 # ── Pydantic models ───────────────────────────────────────────────────────────
-
 class ChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = None
-
 
 class ChatResponse(BaseModel):
     answer: str
     sources: list[str]
     chunks_used: int
 
-
 # ── Routes ────────────────────────────────────────────────────────────────────
-
 @app.get("/")
 def root():
     return {"status": "BhashaBot Backend Running", "version": "1.0.0"}
-
 
 @app.get("/health")
 def health():
@@ -179,12 +182,10 @@ def health():
         "model": "all-MiniLM-L6-v2"
     }
 
-
 @app.get("/stats")
 def stats():
     count = collection.count()
     return {"chunks_stored": count, "ready": count > 0}
-
 
 @app.post("/upload")
 async def upload_notes(file: UploadFile = File(...)):
@@ -193,7 +194,7 @@ async def upload_notes(file: UploadFile = File(...)):
     if not GROQ_API_KEY:
         raise HTTPException(
             status_code=500,
-            detail="GROQ_API_KEY missing. Create backend/.env with: GROQ_API_KEY=gsk_..."
+            detail="GROQ_API_KEY missing. Ensure it is set in Render Environment Variables."
         )
 
     content_type = file.content_type or ""
@@ -234,7 +235,6 @@ async def upload_notes(file: UploadFile = File(...)):
         "preview": text[:300] + ("..." if len(text) > 300 else ""),
     }
 
-
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     print(f"\nChat: {req.question[:80]}")
@@ -267,7 +267,6 @@ async def chat(req: ChatRequest):
         sources=[c[:120] + "..." for c in chunks],
         chunks_used=len(chunks)
     )
-
 
 @app.delete("/clear")
 def clear_notes():
