@@ -3,4 +3,4 @@
 apt-get update && apt-get install -y tesseract-ocr tesseract-ocr-hin
 
 # Install Python dependencies
-pip install -r requirements.txt
+pip install -r ./backend/requirements.txt
